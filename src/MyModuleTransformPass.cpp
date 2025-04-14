@@ -159,6 +159,9 @@ void MyModuleTransformPass::generateReport(const Module &M, llvm::ArrayRef<Mallo
       obj["thread_partitioned"] = MR->IsThreadPartitioned;
       obj["may_conflict"] = MR->MayConflict;
       obj["chaos_score"] = MR->ChaosScore;
+      obj["dynamic_hot_static_low"] = MR->WasDynamicHotButStaticLow;
+      obj["static_hot_dynamic_cold"] = MR->WasStaticHotButDynamicCold;
+
       root.push_back(std::move(obj));
     }
     std::string js;
@@ -189,6 +192,11 @@ void MyModuleTransformPass::generateReport(const Module &M, llvm::ArrayRef<Mallo
       obj["stream"] = MR->IsStreamAccess;
       obj["vectorized"] = MR->IsVectorized;
       obj["parallel"] = MR->IsParallel;
+      obj["thread_partitioned"] = MR->IsThreadPartitioned;
+      obj["may_conflict"] = MR->MayConflict;
+      obj["chaos_score"] = MR->ChaosScore;
+      obj["dynamic_hot_static_low"] = MR->WasDynamicHotButStaticLow;
+      obj["static_hot_dynamic_cold"] = MR->WasStaticHotButDynamicCold;
       root.push_back(std::move(obj));
     }
     std::string js;

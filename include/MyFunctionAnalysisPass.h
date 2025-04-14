@@ -32,14 +32,16 @@ struct MallocRecord {
   uint64_t              AccessedBytes = 0;
   double                AccessTime = 0;
   double                BandwidthScore = 0.0;
+  bool                  WasDynamicHotButStaticLow = false;
+  bool                  WasStaticHotButDynamicCold = false;
   // 访问模式标志
   bool                  IsStreamAccess = false;
   // 向量化标志
   bool                  IsVectorized = false;
   // 并行标志
   bool                  IsParallel = false;
-  bool IsThreadPartitioned = false;
-  bool MayConflict = false;
+  bool                  IsThreadPartitioned = false;
+  bool                  MayConflict = false;
 
   //地址访问混乱度
   double ChaosScore = 0.0;
@@ -89,6 +91,8 @@ private:
   uint64_t getLoopTripCount(llvm::Loop *L, llvm::ScalarEvolution &SE);
   bool detectParallelRuntime(llvm::Function &F);
   double computeBandwidthScore(uint64_t approximateBytes, double approximateTime);
+  double computeMemorySSAStructureScore(const llvm::Instruction *I, llvm::MemorySSA &MSSA);
+  bool isThreadIDRelated(llvm::Value *V);
 
   // 辅助函数：尝试从 Value 中提取常量大小
   std::optional<uint64_t> getConstantAllocSize(llvm::Value *V, std::set<llvm::Value*> &Visited);

@@ -320,126 +320,6 @@ void MyFunctionAnalysisPass::explorePointerUsers(Value *RootPtr, Value *V,
     }
   }
 }
-/*
-double MyFunctionAnalysisPass::computeAccessScore(Instruction *I,
-    LoopAnalysis::Result &LA, 
-    ScalarEvolution &SE, 
-    AAResults &AA, 
-    MemorySSA &MSSA,
-    LoopAccessAnalysis::Result &LAA, 
-    bool isWrite, MallocRecord &MR) {
-    
-    // TODO : 这里的分数计算可以根据实际需求进行调整
-    double base = isWrite ? 8.0 : 5.0; // AccessBaseWrite / AccessBaseRead
-    BasicBlock *BB = I->getParent();
-    Loop *L = LA.getLoopFor(BB);
-    int depth = 0;
-    uint64_t tripCount = 1;
-    if (L) {
-      // 计算循环深度和迭代次数
-      depth = LA.getLoopDepth(BB);
-      tripCount = getLoopTripCount(L, SE);
-
-      if (tripCount == 0 || tripCount == (uint64_t)-1) tripCount = 1;
-      // 此处可扩展对循环内依赖、MemorySSA等更详细判断
-      // 3A) 通过 LAA 分析可能的冲突 / 依赖
-      if (auto *LoopAccessInfo = LAA.getInfo(L)) {
-        // 3A-1) 检查运行时指针冲突 (RuntimePointerChecking)
-        if (auto *RPC = LoopAccessInfo->getRuntimePointerChecking()) {
-          Value *PtrOperand = nullptr;
-          if (auto *LD = dyn_cast<LoadInst>(I)) {
-            PtrOperand = LD->getPointerOperand();
-          } else if (auto *ST = dyn_cast<StoreInst>(I)) {
-            PtrOperand = ST->getPointerOperand();
-          }
-          // 遍历所有需要 Runtime Check 的指针
-          if (PtrOperand) {
-            for (auto &PointerCheck : RPC->Pointers) {
-              if (PointerCheck.PointerValue == PtrOperand) {
-                // 说明这个指针在循环中存在别名不确定性，需要 runtime check
-                base -= 2.0;
-                break;
-                // 减完一次就可以退出
-              }
-            }
-          }
-        }
-        // 3A-2) 检查循环中的依赖情况
-        if (const Dependences *Deps = LoopAccessInfo->getDependences()) {
-          unsigned numDeps = Deps->size();
-          // 这里给一个简单的扣分策略，可自行调整
-          base -= (double)numDeps * 0.5;
-        }
-      }
-      // 3B) MemorySSA 分析
-      if (auto *MemAcc = MSSA.getMemoryAccess(I)) {
-        if (auto *MU = dyn_cast<MemoryUse>(MemAcc)) {
-          // 判断其定义者是否是 MemoryDef
-          if (auto *Src = MU->getDefiningAccess()) {
-            if (isa<MemoryDef>(Src)) {
-              base -= 1.0;
-            }
-          }
-        } else if (auto *MD = dyn_cast<MemoryDef>(MemAcc)) {
-          base -= 0.5;
-        } else if (auto *MPhi = dyn_cast<MemoryPhi>(MemAcc)) {
-          base -= 0.3;
-        }
-      }
-      // 3C) 进一步通过 SCEV 判断跨步访问
-      Value *PtrOperand = nullptr;
-      if (auto *LD = dyn_cast<LoadInst>(I)) {
-        PtrOperand = LD->getPointerOperand();
-      } else if (auto *ST = dyn_cast<StoreInst>(I)) {
-        PtrOperand = ST->getPointerOperand();
-      }
-      if (PtrOperand && SE.isSCEVable(PtrOperand->getType())) {
-        const SCEV *PtrSCEV = SE.getSCEV(PtrOperand);
-          if (auto *AR = dyn_cast<SCEVAddRecExpr>(PtrSCEV)) {
-            if (AR->isAffine()) {
-              const SCEV *Step = AR->getStepRecurrence(SE);
-              if (auto *StepConst = dyn_cast<SCEVConstant>(Step)) {
-                int64_t Stride = StepConst->getAPInt().getSExtValue();
-          
-                if (Stride != 0) {
-                  MR.IsStreamAccess = true;
-                  if (std::abs(Stride) == 1)
-                    base += StreamBonus;
-                  else if (std::abs(Stride) % 64 == 0)
-                    base += StreamBonus * 0.8;
-                  else if (std::abs(Stride) < 1024)
-                    base += StreamBonus * 0.5;
-                  else
-                    base += StreamBonus * 0.2;
-                }
-              }
-            }
-          }
-      }
-      // 3D) 使用 LoopAccessAnalysis 检查向量化潜力
-      //     (仅做简易示例，可根据实际情况更加精细地判断)
-      if (auto *LAI = LAA.getInfo(L)) {
-        unsigned MaxSafeDepDist = LAI->getMaxSafeDepDistBytes();
-        // 如果依赖距离足够大 (或者 != -1U)，就认为有较高向量化潜力
-        if (MaxSafeDepDist != (unsigned)-1) {
-          MR.IsVectorized = true;
-          base += VectorBonus;
-        }
-      }
-    }
-
-
-    double result = base * (depth + 1) * std::sqrt((double)tripCount);
-    if (MR.IsParallel)
-      result += 5.0;
-    //TODO 这里的分数可以根据实际的命令行输入进行调整
-    if (MR.IsVectorized)
-      result += 5.0;
-    if (MR.IsStreamAccess)
-      result += 10.0;
-    return result;
-}
-*/
 double computeMemorySSAStructureScore(const llvm::Instruction *I, llvm::MemorySSA &MSSA) {
   using namespace llvm;
   const unsigned MaxDepth = 12;
@@ -590,7 +470,23 @@ bool isLoopMarkedVectorizable(const llvm::Loop *L) {
   return false;
 }
 
-
+bool isMarkedParallel(llvm::Loop *LoopPtr) {
+  if (!LoopPtr || !LoopPtr->getHeader()) return false;
+  llvm::Instruction *Term = LoopPtr->getHeader()->getTerminator();
+  if (auto *MD = Term->getMetadata("llvm.loop")) {
+    for (auto &Op : MD->operands()) {
+      if (auto *Node = llvm::dyn_cast<llvm::MDNode>(Op)) {
+        for (auto &Sub : Node->operands()) {
+          if (auto *Str = llvm::dyn_cast<llvm::MDString>(Sub)) {
+            if (Str->getString().contains("parallel_accesses"))
+              return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
 double MyFunctionAnalysisPass::computeAccessScore(Instruction *I,
   LoopAnalysis::Result &LA, 
   ScalarEvolution &SE, 
@@ -598,7 +494,7 @@ double MyFunctionAnalysisPass::computeAccessScore(Instruction *I,
   MemorySSA &MSSA,
   LoopAccessAnalysis::Result &LAA, 
   bool isWrite, MallocRecord &MR) {
-  
+
   using namespace MyHBMOptions;
 
   double base = isWrite ? AccessBaseWrite : AccessBaseRead;
@@ -612,74 +508,40 @@ double MyFunctionAnalysisPass::computeAccessScore(Instruction *I,
     tripCount = getLoopTripCount(L, SE);
     if (tripCount == 0 || tripCount == (uint64_t)-1) tripCount = 1;
 
-
-    // MemorySSA 深度依赖剖析
-    if (auto *MemAcc = MSSA.getMemoryAccess(I)) {
-      unsigned DefDepth = 0;
-      const unsigned MaxDepth = 10; // 防止死循环
-
-      const MemoryAccess *Current = MemAcc;
-      while (Current && isa<MemoryUseOrDef>(Current) && DefDepth < MaxDepth) {
-        if (auto *MU = dyn_cast<MemoryUse>(Current)) {
-          Current = MU->getDefiningAccess();
-        } else if (auto *MD = dyn_cast<MemoryDef>(Current)) {
-          Current = MD->getDefiningAccess();
-          DefDepth++;
-        } else {
-          break;
-        }
-      }
-
-      // 深度越大，认为依赖链越复杂 → 减分
-      if (DefDepth >= 3) {
-        base -= std::min(1.0, DefDepth * 0.3);
-      }
-
-      // MemoryPhi 检查（常出现在合流点）
-      if (isa<MemoryPhi>(MemAcc)) {
-        base -= 0.5;
-        MR.IsStreamAccess = false; // 极可能打破流式模式
-      }
-    }
-
-
-    // LoopAccessAnalysis 依赖冲突分析
-    if (auto *LoopAccessInfo = LAA.getInfo(L)) {
-      if (auto *RPC = LoopAccessInfo->getRuntimePointerChecking()) {
-        Value *PtrOperand = nullptr;
-        if (auto *LD = dyn_cast<LoadInst>(I)) {
-          PtrOperand = LD->getPointerOperand();
-        } else if (auto *ST = dyn_cast<StoreInst>(I)) {
-          PtrOperand = ST->getPointerOperand();
-        }
-        if (PtrOperand) {
-          for (auto &Check : RPC->Pointers) {
-            if (Check.PointerValue == PtrOperand) {
-              base -= 2.0;
-              break;
-            }
-          }
-        }
-      }
-      if (const Dependences *Deps = LoopAccessInfo->getDependences()) {
-        base -= (double)Deps->size() * 0.5;
-      }
-    }
-
-    // 指针分析起点
+    // 指针操作对象提取
     Value *PtrOperand = nullptr;
     if (auto *LD = dyn_cast<LoadInst>(I))
       PtrOperand = LD->getPointerOperand();
     else if (auto *ST = dyn_cast<StoreInst>(I))
       PtrOperand = ST->getPointerOperand();
 
-    // 一、SCEV-based stride 分析
+    // ===== MemorySSA 结构复杂度分析 =====
+    double ssaComplexity = computeMemorySSAStructureScore(I, MSSA);
+    base -= ssaComplexity;
+    MR.SSAComplexityScore = ssaComplexity;
+
+    // ===== LoopAccessAnalysis 依赖冲突检测 =====
+    auto *LAI = LAA.getInfo(L);
+    if (LAI) {
+      if (auto *RPC = LAI->getRuntimePointerChecking()) {
+        for (auto &Check : RPC->Pointers) {
+          if (Check.PointerValue == PtrOperand) {
+            base -= 2.0;
+            break;
+          }
+        }
+      }
+      if (const Dependences *Deps = LAI->getDependences()) {
+        base -= (double)Deps->size() * 0.5;
+      }
+    }
+
+    // ===== SCEV 基于步长的流式访问分析 =====
     if (PtrOperand && SE.isSCEVable(PtrOperand->getType())) {
       const SCEV *PtrSCEV = SE.getSCEV(PtrOperand);
       if (auto *AR = dyn_cast<SCEVAddRecExpr>(PtrSCEV)) {
         if (AR->isAffine()) {
-          const SCEV *Step = AR->getStepRecurrence(SE);
-          if (auto *StepConst = dyn_cast<SCEVConstant>(Step)) {
+          if (auto *StepConst = dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE))) {
             int64_t Stride = StepConst->getValue()->getSExtValue();
             if (Stride != 0) {
               MR.IsStreamAccess = true;
@@ -698,8 +560,8 @@ double MyFunctionAnalysisPass::computeAccessScore(Instruction *I,
       }
     }
 
-    // 二、LoopAccessAnalysis symbolic stride 判定（如 A[i*N + j]）
-    if (auto *LAI = LAA.getInfo(L)) {
+    // ===== LoopAccessInfo 的 symbolic stride 判定 =====
+    if (LAI) {
       auto &StrideMap = LAI->getSymbolicStrides();
       auto It = StrideMap.find(PtrOperand);
       if (It != StrideMap.end()) {
@@ -708,7 +570,7 @@ double MyFunctionAnalysisPass::computeAccessScore(Instruction *I,
       }
     }
 
-    // 三、多维数组访问判定（GEP -> affine SCEV）
+    // ===== 多维数组访问结构分析 =====
     if (auto *GEP = dyn_cast<GetElementPtrInst>(PtrOperand)) {
       const SCEV *S = SE.getSCEV(GEP);
       if (auto *AddRec = dyn_cast<SCEVAddRecExpr>(S)) {
@@ -722,36 +584,43 @@ double MyFunctionAnalysisPass::computeAccessScore(Instruction *I,
       }
     }
 
-    // 四、向量化潜力
-    if (auto *LAI = LAA.getInfo(L)) {
-      unsigned MaxSafeDepDist = LAI->getMaxSafeDepDistBytes();
-      if (MaxSafeDepDist != (unsigned)-1) {
-        MR.IsVectorized = true;
-        base += VectorBonus;
-      }
+    // ===== 向量化潜力判定 =====
+    if (LAI && LAI->getMaxSafeDepDistBytes() != (unsigned)-1) {
+      MR.IsVectorized = true;
+      base += VectorBonus;
     }
-    // 五、被标记为向量化的循环 
+
+    // ===== 向量化metadata标记判定 =====
     if (isLoopMarkedVectorizable(L)) {
       MR.IsVectorized = true;
       base += VectorBonus;
     }
+
+    // ===== 并行化分析 =====
+    if (MR.IsParallel) {
+      bool IsLoopSafe = LAI && LAI->isDependencySafe();
+      bool MarkedParallel = isMarkedParallel(L);
+      bool ThreadPartitioned = PtrOperand && isThreadIDRelated(PtrOperand);
+
+      if ((IsLoopSafe || MarkedParallel) && ThreadPartitioned) {
+        MR.IsThreadPartitioned = true;
+        base += ParallelBonus * 1.5;
+      } else if (IsLoopSafe || MarkedParallel) {
+        MR.MayConflict = true;
+        base -= ParallelBonus * 0.5;
+      } else {
+        MR.MayConflict = true;
+        base -= ParallelBonus;
+      }
+    }
   }
 
-  
-  // 计算 MemorySSA 结构复杂度得分
-  double SSAComplexityScore = computeMemorySSAStructureScore(I, MSSA);
-  if (SSAComplexityScore > 0.0) {
-    base -= SSAComplexityScore;
-    MR.SSAComplexityScore = SSAComplexityScore;
-  }
-  // 计算内存访问混乱度得分
-  double chaosPenalty = computeAccessChaosScore(PtrOperand, MSSA, SE);
-  // 记录混乱度得分到 MallocRecord
-  MR.ChaosScore = chaosPenalty;
-  base -= chaosPenalty;
+  // ===== 混乱度评分 =====
+  double chaos = computeAccessChaosScore(PtrOperand, MSSA, SE);
+  MR.ChaosScore = chaos;
+  base -= chaos;
 
-  // 计算最终得分
-  // 这里的分数可以根据实际的命令行输入进行调整
+  // ===== 最终得分计算 =====
   double score = base * (depth + 1) * std::sqrt((double)tripCount);
   if (MR.IsParallel)
     score += ParallelBonus;
@@ -759,6 +628,26 @@ double MyFunctionAnalysisPass::computeAccessScore(Instruction *I,
     score += VectorBonus;
   if (MR.IsStreamAccess)
     score += StreamBonus;
+
+  // ===== 动态 profile 融合校正评分 =====
+  if (MR.DynamicAccessCount > 0) {
+    double dynamicWeight = std::log((double)MR.DynamicAccessCount + 1.0);
+
+    // 若静态判定为混乱，但运行热度很高 → 加回一定权重
+    if (MR.ChaosScore > 2.0 && dynamicWeight > 10.0) {
+      score += dynamicWeight * 0.3; // 补偿
+    }
+
+    // 若静态分高，但动态访问极少 → 说明是伪热点
+    if (score > 50.0 && dynamicWeight < 5.0) {
+      score -= 10.0; // 降权
+    }
+
+    // 若 MemorySSA结构复杂，但运行时确实频繁访问，也应部分补偿
+    if (MR.SSAComplexityScore > 2.0 && dynamicWeight > 10.0) {
+      score += 2.0;
+    }
+  }
 
   return score;
 }
