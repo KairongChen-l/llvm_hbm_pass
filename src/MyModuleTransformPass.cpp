@@ -156,6 +156,9 @@ void MyModuleTransformPass::generateReport(const Module &M, llvm::ArrayRef<Mallo
       obj["stream"] = MR->IsStreamAccess;
       obj["vectorized"] = MR->IsVectorized;
       obj["parallel"] = MR->IsParallel;
+      obj["thread_partitioned"] = MR->IsThreadPartitioned;
+      obj["may_conflict"] = MR->MayConflict;
+      obj["chaos_score"] = MR->ChaosScore;
       root.push_back(std::move(obj));
     }
     std::string js;

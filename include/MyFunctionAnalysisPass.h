@@ -32,10 +32,17 @@ struct MallocRecord {
   uint64_t              AccessedBytes = 0;
   double                AccessTime = 0;
   double                BandwidthScore = 0.0;
-  // 模式标志
+  // 访问模式标志
   bool                  IsStreamAccess = false;
+  // 向量化标志
   bool                  IsVectorized = false;
+  // 并行标志
   bool                  IsParallel = false;
+  bool IsThreadPartitioned = false;
+  bool MayConflict = false;
+
+  //地址访问混乱度
+  double ChaosScore = 0.0;
 };
 
 // 函数级的分析结果

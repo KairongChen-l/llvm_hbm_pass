@@ -208,6 +208,34 @@ Value* MyFunctionAnalysisPass::findBasePointer(Value *V) {
   return nullptr;
 }
 
+bool isThreadIDRelated(llvm::Value *V) {
+  using namespace llvm;
+  std::queue<Value*> Q;
+  std::unordered_set<Value*> Visited;
+  Q.push(V);
+
+  while (!Q.empty()) {
+    Value *Cur = Q.front();
+    Q.pop();
+    if (!Visited.insert(Cur).second)
+      continue;
+
+    if (auto *CI = dyn_cast<CallInst>(Cur)) {
+      Function *F = CI->getCalledFunction();
+      if (F && (F->getName().contains("omp_get_thread_num") ||
+                F->getName().contains("pthread_self") ||
+                F->getName().contains("threadIdx") || 
+                F->getName().contains("get_local_id"))) {
+        return true;
+      }
+    }
+    for (auto *Op : Cur->operands())
+      Q.push(Op);
+  }
+  return false;
+}
+
+
 void MyFunctionAnalysisPass::explorePointerUsers(Value *RootPtr, Value *V,
     LoopAnalysis::Result &LA, 
     ScalarEvolution &SE, 
@@ -246,6 +274,16 @@ void MyFunctionAnalysisPass::explorePointerUsers(Value *RootPtr, Value *V,
         }
       }
       else if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) {
+        for (auto idx = GEP->idx_begin(); idx != GEP->idx_end(); ++idx) {
+          Value *IV = idx->get();
+          if (isThreadIDRelated(IV)) {
+            MR.IsThreadPartitioned = true;
+          }
+        }
+        if (MR.IsParallel && !MR.IsThreadPartitioned && !MR.IsStreamAccess) {
+          MR.MayConflict = true;
+          Score -= 5.0; // 可根据 hbm-conflict-penalty 控制
+        }        
         bool IsLikelyStream = true;
         for (auto idx = GEP->idx_begin(); idx != GEP->idx_end(); ++idx) {
           if (auto *CI = dyn_cast<ConstantInt>(idx->get())) {
@@ -282,7 +320,7 @@ void MyFunctionAnalysisPass::explorePointerUsers(Value *RootPtr, Value *V,
     }
   }
 }
-
+/*
 double MyFunctionAnalysisPass::computeAccessScore(Instruction *I,
     LoopAnalysis::Result &LA, 
     ScalarEvolution &SE, 
@@ -357,29 +395,26 @@ double MyFunctionAnalysisPass::computeAccessScore(Instruction *I,
       }
       if (PtrOperand && SE.isSCEVable(PtrOperand->getType())) {
         const SCEV *PtrSCEV = SE.getSCEV(PtrOperand);
-        if (auto *AR = dyn_cast<SCEVAddRecExpr>(PtrSCEV)) {
-          // SCEVAddRecExpr 表示 Ptr 在循环 L 中随迭代呈线性变化
-          // 判断是否是线性表达式
-          if (AR->isAffine()) {
-            const SCEV *Step = AR->getStepRecurrence(SE);
-            if (auto *StepConst = dyn_cast<SCEVConstant>(Step)) {
-              int64_t Stride = StepConst->getValue()->getSExtValue();
-              // 假设跨步为 1 或 -1 时属于“连续流式”
-              if (std::abs(Stride) == 1) {
-                MR.IsStreamAccess = true;
-                base += StreamBonus;
-                // 流式加分
-              } else if ((Stride % 64) == 0) {
-                // 对于 64 字节对齐的跨步也给一部分加成
-                base += StreamBonus * 0.5;
-              } else {
-                // 其他跨步可视需要调节
-                base -= 0.2;
-                // 小幅度减分作为示例
+          if (auto *AR = dyn_cast<SCEVAddRecExpr>(PtrSCEV)) {
+            if (AR->isAffine()) {
+              const SCEV *Step = AR->getStepRecurrence(SE);
+              if (auto *StepConst = dyn_cast<SCEVConstant>(Step)) {
+                int64_t Stride = StepConst->getAPInt().getSExtValue();
+          
+                if (Stride != 0) {
+                  MR.IsStreamAccess = true;
+                  if (std::abs(Stride) == 1)
+                    base += StreamBonus;
+                  else if (std::abs(Stride) % 64 == 0)
+                    base += StreamBonus * 0.8;
+                  else if (std::abs(Stride) < 1024)
+                    base += StreamBonus * 0.5;
+                  else
+                    base += StreamBonus * 0.2;
+                }
               }
             }
           }
-        }
       }
       // 3D) 使用 LoopAccessAnalysis 检查向量化潜力
       //     (仅做简易示例，可根据实际情况更加精细地判断)
@@ -404,6 +439,330 @@ double MyFunctionAnalysisPass::computeAccessScore(Instruction *I,
       result += 10.0;
     return result;
 }
+*/
+double computeMemorySSAStructureScore(const llvm::Instruction *I, llvm::MemorySSA &MSSA) {
+  using namespace llvm;
+  const unsigned MaxDepth = 12;
+  const unsigned MaxFanOut = 5;
+
+  const MemoryAccess *Root = MSSA.getMemoryAccess(I);
+  if (!Root)
+    return 0.0;
+
+  std::set<const MemoryAccess*> Visited;
+  std::queue<const MemoryAccess*> Queue;
+  Queue.push(Root);
+
+  unsigned FanOutPenalty = 0;
+  unsigned PhiPenalty = 0;
+  unsigned NodeCount = 0;
+
+  while (!Queue.empty() && NodeCount < 100) {
+    const MemoryAccess *Cur = Queue.front();
+    Queue.pop();
+
+    if (!Visited.insert(Cur).second)
+      continue;
+
+    NodeCount++;
+
+    // 统计 MemoryPhi 的分支数
+    if (auto *MP = dyn_cast<MemoryPhi>(Cur)) {
+      PhiPenalty += MP->getNumIncomingValues() - 1;
+      for (auto &Op : MP->incoming_values())
+        if (auto *MA = dyn_cast<MemoryAccess>(Op))
+          Queue.push(MA);
+    }
+    // MemoryDef / MemoryUse
+    else if (auto *MU = dyn_cast<MemoryUseOrDef>(Cur)) {
+      const MemoryAccess *Def = MU->getDefiningAccess();
+      if (Def)
+        Queue.push(Def);
+    }
+
+    // Fan-out: 统计一个 MemoryAccess 被多个 MemoryUse 使用的情况
+    unsigned UseCount = 0;
+    for (const auto *User : Cur->users()) {
+      if (isa<MemoryUseOrDef>(User))
+        UseCount++;
+    }
+    if (UseCount > MaxFanOut)
+      FanOutPenalty += UseCount - MaxFanOut;
+  }
+
+  // 聚合 penalty 转换为得分（值越高说明结构越复杂）
+  double penalty = PhiPenalty * 0.5 + FanOutPenalty * 0.2;
+  return std::min(penalty, 5.0); // 最多扣5分
+}
+
+double computeAccessChaosScore(llvm::Value *BasePtr, llvm::MemorySSA &MSSA, llvm::ScalarEvolution &SE) {
+  using namespace llvm;
+
+  std::unordered_set<const GetElementPtrInst*> GEPs;
+  std::unordered_set<const Type*> AccessTypes;
+  std::unordered_set<const Value*> IndexSources;
+  unsigned BitcastCount = 0;
+  unsigned IndirectIndexCount = 0;
+  unsigned NonAffineAccesses = 0;
+
+  std::queue<const Value*> Q;
+  std::unordered_set<const Value*> Visited;
+  Q.push(BasePtr);
+
+  while (!Q.empty()) {
+    const Value *V = Q.front();
+    Q.pop();
+    if (!Visited.insert(V).second)
+      continue;
+
+    for (const User *U : V->users()) {
+      if (auto *I = dyn_cast<Instruction>(U)) {
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) {
+          GEPs.insert(GEP);
+          for (auto idx = GEP->idx_begin(); idx != GEP->idx_end(); ++idx) {
+            if (!isa<ConstantInt>(idx->get())) {
+              IndexSources.insert(idx->get());
+              if (isa<LoadInst>(idx->get()))
+                IndirectIndexCount++;
+            }
+          }
+          Q.push(GEP);
+        } else if (auto *BC = dyn_cast<BitCastInst>(I)) {
+          BitcastCount++;
+          Q.push(BC);
+        } else if (auto *LD = dyn_cast<LoadInst>(I)) {
+          AccessTypes.insert(LD->getType());
+        } else if (auto *ST = dyn_cast<StoreInst>(I)) {
+          AccessTypes.insert(ST->getValueOperand()->getType());
+        }
+        // 检测是否是复杂的非线性 SCEV
+        if (SE.isSCEVable(I->getType())) {
+          const SCEV *S = SE.getSCEV(const_cast<Value*>(I));
+          if (!isa<SCEVAddRecExpr>(S) && !S->isAffine()) {
+            NonAffineAccesses++;
+          }
+        }
+      }
+    }
+  }
+
+  // 计算 chaos 分值
+  double chaosScore = 0.0;
+  if (GEPs.size() > 5)
+    chaosScore += (GEPs.size() - 5) * 0.2;
+  if (IndirectIndexCount > 0)
+    chaosScore += IndirectIndexCount * 0.5;
+  if (NonAffineAccesses > 0)
+    chaosScore += NonAffineAccesses * 0.3;
+  if (BitcastCount > 3)
+    chaosScore += (BitcastCount - 3) * 0.2;
+  if (AccessTypes.size() > 3)
+    chaosScore += (AccessTypes.size() - 3) * 0.3;
+  if (chaosScore > 5.0)
+    chaosScore = 5.0;
+  
+  return chaosScore;
+}
+
+bool isLoopMarkedVectorizable(const llvm::Loop *L) {
+  using namespace llvm;
+
+  if (!L || !L->getHeader())
+    return false;
+
+  const TerminatorInst *Term = L->getHeader()->getTerminator();
+  if (!Term)
+    return false;
+
+  if (MDNode *LoopMD = Term->getMetadata("llvm.loop")) {
+    for (unsigned i = 0; i < LoopMD->getNumOperands(); ++i) {
+      MDNode *MD = dyn_cast<MDNode>(LoopMD->getOperand(i));
+      if (!MD || MD == LoopMD)
+        continue;
+      for (unsigned j = 0; j < MD->getNumOperands(); ++j) {
+        if (auto *Str = dyn_cast<MDString>(MD->getOperand(j))) {
+          if (Str->getString().equals("llvm.loop.vectorize.enable"))
+            return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+
+double MyFunctionAnalysisPass::computeAccessScore(Instruction *I,
+  LoopAnalysis::Result &LA, 
+  ScalarEvolution &SE, 
+  AAResults &AA, 
+  MemorySSA &MSSA,
+  LoopAccessAnalysis::Result &LAA, 
+  bool isWrite, MallocRecord &MR) {
+  
+  using namespace MyHBMOptions;
+
+  double base = isWrite ? AccessBaseWrite : AccessBaseRead;
+  BasicBlock *BB = I->getParent();
+  Loop *L = LA.getLoopFor(BB);
+  int depth = 0;
+  uint64_t tripCount = 1;
+
+  if (L) {
+    depth = LA.getLoopDepth(BB);
+    tripCount = getLoopTripCount(L, SE);
+    if (tripCount == 0 || tripCount == (uint64_t)-1) tripCount = 1;
+
+
+    // MemorySSA 深度依赖剖析
+    if (auto *MemAcc = MSSA.getMemoryAccess(I)) {
+      unsigned DefDepth = 0;
+      const unsigned MaxDepth = 10; // 防止死循环
+
+      const MemoryAccess *Current = MemAcc;
+      while (Current && isa<MemoryUseOrDef>(Current) && DefDepth < MaxDepth) {
+        if (auto *MU = dyn_cast<MemoryUse>(Current)) {
+          Current = MU->getDefiningAccess();
+        } else if (auto *MD = dyn_cast<MemoryDef>(Current)) {
+          Current = MD->getDefiningAccess();
+          DefDepth++;
+        } else {
+          break;
+        }
+      }
+
+      // 深度越大，认为依赖链越复杂 → 减分
+      if (DefDepth >= 3) {
+        base -= std::min(1.0, DefDepth * 0.3);
+      }
+
+      // MemoryPhi 检查（常出现在合流点）
+      if (isa<MemoryPhi>(MemAcc)) {
+        base -= 0.5;
+        MR.IsStreamAccess = false; // 极可能打破流式模式
+      }
+    }
+
+
+    // LoopAccessAnalysis 依赖冲突分析
+    if (auto *LoopAccessInfo = LAA.getInfo(L)) {
+      if (auto *RPC = LoopAccessInfo->getRuntimePointerChecking()) {
+        Value *PtrOperand = nullptr;
+        if (auto *LD = dyn_cast<LoadInst>(I)) {
+          PtrOperand = LD->getPointerOperand();
+        } else if (auto *ST = dyn_cast<StoreInst>(I)) {
+          PtrOperand = ST->getPointerOperand();
+        }
+        if (PtrOperand) {
+          for (auto &Check : RPC->Pointers) {
+            if (Check.PointerValue == PtrOperand) {
+              base -= 2.0;
+              break;
+            }
+          }
+        }
+      }
+      if (const Dependences *Deps = LoopAccessInfo->getDependences()) {
+        base -= (double)Deps->size() * 0.5;
+      }
+    }
+
+    // 指针分析起点
+    Value *PtrOperand = nullptr;
+    if (auto *LD = dyn_cast<LoadInst>(I))
+      PtrOperand = LD->getPointerOperand();
+    else if (auto *ST = dyn_cast<StoreInst>(I))
+      PtrOperand = ST->getPointerOperand();
+
+    // 一、SCEV-based stride 分析
+    if (PtrOperand && SE.isSCEVable(PtrOperand->getType())) {
+      const SCEV *PtrSCEV = SE.getSCEV(PtrOperand);
+      if (auto *AR = dyn_cast<SCEVAddRecExpr>(PtrSCEV)) {
+        if (AR->isAffine()) {
+          const SCEV *Step = AR->getStepRecurrence(SE);
+          if (auto *StepConst = dyn_cast<SCEVConstant>(Step)) {
+            int64_t Stride = StepConst->getValue()->getSExtValue();
+            if (Stride != 0) {
+              MR.IsStreamAccess = true;
+              int64_t absStride = std::abs(Stride);
+              if (absStride == 1)
+                base += StreamBonus;
+              else if (absStride % 64 == 0)
+                base += StreamBonus * 0.8;
+              else if (absStride < 1024)
+                base += StreamBonus * 0.5;
+              else
+                base += StreamBonus * 0.2;
+            }
+          }
+        }
+      }
+    }
+
+    // 二、LoopAccessAnalysis symbolic stride 判定（如 A[i*N + j]）
+    if (auto *LAI = LAA.getInfo(L)) {
+      auto &StrideMap = LAI->getSymbolicStrides();
+      auto It = StrideMap.find(PtrOperand);
+      if (It != StrideMap.end()) {
+        MR.IsStreamAccess = true;
+        base += StreamBonus * 0.6;
+      }
+    }
+
+    // 三、多维数组访问判定（GEP -> affine SCEV）
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(PtrOperand)) {
+      const SCEV *S = SE.getSCEV(GEP);
+      if (auto *AddRec = dyn_cast<SCEVAddRecExpr>(S)) {
+        if (AddRec->isAffine()) {
+          MR.IsStreamAccess = true;
+          base += StreamBonus * 0.4;
+        }
+      } else if (S->isAffine()) {
+        MR.IsStreamAccess = true;
+        base += StreamBonus * 0.3;
+      }
+    }
+
+    // 四、向量化潜力
+    if (auto *LAI = LAA.getInfo(L)) {
+      unsigned MaxSafeDepDist = LAI->getMaxSafeDepDistBytes();
+      if (MaxSafeDepDist != (unsigned)-1) {
+        MR.IsVectorized = true;
+        base += VectorBonus;
+      }
+    }
+    // 五、被标记为向量化的循环 
+    if (isLoopMarkedVectorizable(L)) {
+      MR.IsVectorized = true;
+      base += VectorBonus;
+    }
+  }
+
+  
+  // 计算 MemorySSA 结构复杂度得分
+  double SSAComplexityScore = computeMemorySSAStructureScore(I, MSSA);
+  if (SSAComplexityScore > 0.0) {
+    base -= SSAComplexityScore;
+    MR.SSAComplexityScore = SSAComplexityScore;
+  }
+  // 计算内存访问混乱度得分
+  double chaosPenalty = computeAccessChaosScore(PtrOperand, MSSA, SE);
+  // 记录混乱度得分到 MallocRecord
+  MR.ChaosScore = chaosPenalty;
+  base -= chaosPenalty;
+
+  // 计算最终得分
+  // 这里的分数可以根据实际的命令行输入进行调整
+  double score = base * (depth + 1) * std::sqrt((double)tripCount);
+  if (MR.IsParallel)
+    score += ParallelBonus;
+  if (MR.IsVectorized)
+    score += VectorBonus;
+  if (MR.IsStreamAccess)
+    score += StreamBonus;
+
+  return score;
+}
+
 
 uint64_t MyFunctionAnalysisPass::getLoopTripCount(Loop *L, ScalarEvolution &SE) {
   if (!L) return 1;

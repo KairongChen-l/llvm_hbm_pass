@@ -10,7 +10,7 @@
 // 这里是用户态的函数，调用时传入要探测的内存地址和大小
 void my_probe(void *start_addr, size_t size)
 {
-    int fd = open("/dev/my_probe_dev", O_RDWR);
+    int fd = open("/dev/my_probe_driver", O_RDWR);
     if (fd < 0) {
         perror("[my_probe] open failed");
         return;
