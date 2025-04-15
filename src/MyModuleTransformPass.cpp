@@ -105,12 +105,29 @@ void MyModuleTransformPass::loadExternalProfile(Module &M, llvm::SmallVectorImpl
 }
 
 void MyModuleTransformPass::processMallocRecords(Module &M, llvm::SmallVectorImpl<MallocRecord*> &AllMallocs) {
+  
+  // 先计算自适应阈值
+  std::vector<MallocRecord> AllMallocsVec;
+  for (auto *MR : AllMallocs) {
+    if (MR) AllMallocsVec.push_back(*MR);
+  }
+  
+  MyFunctionAnalysisPass MFAP;
+  AdaptiveThresholdInfo ThresholdInfo = MFAP.computeAdaptiveThreshold(M, AllMallocsVec);
+  
+  // 输出自适应阈值信息
+  errs() << "[HBM] Using adaptive threshold: " << ThresholdInfo.adjustedThreshold 
+         << " (base: " << ThresholdInfo.baseThreshold 
+         << "): " << ThresholdInfo.adjustmentReason << "\n";
+  
+  // 排序和处理 MallocRecords
   std::sort(AllMallocs.begin(), AllMallocs.end(),
             [](const MallocRecord *A, const MallocRecord *B) {
               if (A->UserForcedHot != B->UserForcedHot)
                 return (A->UserForcedHot > B->UserForcedHot);
-              return (A->Score > B->Score);
+              return (A->ProfileAdjustedScore > B->ProfileAdjustedScore);
             });
+  
   uint64_t used = 0ULL;
   uint64_t capacity = DefaultHBMCapacity;
   LLVMContext &Ctx = M.getContext();
@@ -123,15 +140,26 @@ void MyModuleTransformPass::processMallocRecords(Module &M, llvm::SmallVectorImp
   FunctionCallee HBMFree = M.getOrInsertFunction(
       "hbm_free",
       FunctionType::get(VoidTy, {Int8PtrTy}, false));
+  
   for (auto *MR : AllMallocs) {
     if (!MR->MallocCall)
       continue;
-    if (!MR->UserForcedHot && MR->Score < MyHBMOptions::HBMThreshold)
+    if (!MR->UserForcedHot && MR->ProfileAdjustedScore < ThresholdInfo.adjustedThreshold)
       continue;
     if (!MR->UserForcedHot && (used + MR->AllocSize > capacity))
       continue;
+    
+    // 提供详细的决策信息输出
+    errs() << "[HBM] Moving to HBM: " << getSourceLocation(MR->MallocCall) 
+    << " | Score: " << MR->ProfileAdjustedScore 
+    << " | Bandwidth: " << MR->MultiDimScore.bandwidthScore
+    << " | Latency: " << MR->MultiDimScore.latencyScore
+    << " | Utilization: " << MR->MultiDimScore.utilizationScore
+    << " | Size efficiency: " << MR->MultiDimScore.sizeEfficiencyScore
+    << "\n";
     MR->MallocCall->setCalledFunction(HBMAlloc.getCallee());
     used += MR->AllocSize;
+    // 直接使用 FreeCalls，而不是通过指针访问
     for (auto *fc : MR->FreeCalls)
       fc->setCalledFunction(HBMFree.getCallee());
   }
@@ -146,21 +174,88 @@ void MyModuleTransformPass::generateReport(const Module &M, llvm::ArrayRef<Mallo
       if (!MR->MallocCall)
         continue;
       json::Object obj;
-      obj["location"] = getSourceLocation(MR->MallocCall);
-      obj["size"] = (double)MR->AllocSize;
+      // 位置信息
+      obj["location"] = MR->SourceLocation;
+      obj["size"] = MR->AllocSize;
+
+      // 总得分
       obj["score"] = MR->Score;
-      obj["forced_hot"] = MR->UserForcedHot;
-      obj["unmatched_free"] = MR->UnmatchedFree;
-      obj["dyn_access"] = (double)MR->DynamicAccessCount;
-      obj["est_bw"] = MR->EstimatedBandwidth;
+
+      // 得分因子（加分项）
+      obj["stream_score"] = MR->StreamScore;
+      obj["vector_score"] = MR->VectorScore;
+      obj["parallel_score"] = MR->ParallelScore;
+
+      // 扣分因子
+      obj["ssa_penalty"] = MR->SSAPenalty;
+      obj["chaos_penalty"] = MR->ChaosPenalty;
+      obj["conflict_penalty"] = MR->ConflictPenalty;
+
+      // 静态分析状态
       obj["stream"] = MR->IsStreamAccess;
       obj["vectorized"] = MR->IsVectorized;
       obj["parallel"] = MR->IsParallel;
       obj["thread_partitioned"] = MR->IsThreadPartitioned;
       obj["may_conflict"] = MR->MayConflict;
-      obj["chaos_score"] = MR->ChaosScore;
+
+      // Loop特征
+      obj["loop_depth"] = MR->LoopDepth;
+      obj["trip_count"] = MR->TripCount;
+
+      // 动态 profile 信息
+      obj["dyn_access"] = MR->DynamicAccessCount;
+      obj["est_bw"] = MR->EstimatedBandwidth;
+
+      // 分析矛盾标志
       obj["dynamic_hot_static_low"] = MR->WasDynamicHotButStaticLow;
       obj["static_hot_dynamic_cold"] = MR->WasStaticHotButDynamicCold;
+
+      // 其它状态标记
+      obj["forced_hot"] = MR->UserForcedHot;
+      obj["unmatched_free"] = MR->UnmatchedFree;
+
+      // 添加扩展分析结果
+      // 跨函数分析
+      json::Object crossFnObj;
+      crossFnObj["cross_func_score"] = MR->CrossFnInfo.crossFuncScore;
+      crossFnObj["called_funcs_count"] = MR->CrossFnInfo.calledFunctions.size();
+      crossFnObj["caller_funcs_count"] = MR->CrossFnInfo.callerFunctions.size();
+      crossFnObj["external_func_propagation"] = MR->CrossFnInfo.isPropagatedToExternalFunc;
+      crossFnObj["hot_func_usage"] = MR->CrossFnInfo.isUsedInHotFunction;
+      obj["cross_function"] = std::move(crossFnObj);
+      
+      // 数据流分析
+      json::Object dataFlowObj;
+      dataFlowObj["data_flow_score"] = MR->DataFlowInfo.dataFlowScore;
+      dataFlowObj["has_init_phase"] = MR->DataFlowInfo.hasInitPhase;
+      dataFlowObj["has_read_only_phase"] = MR->DataFlowInfo.hasReadOnlyPhase;
+      dataFlowObj["has_dormant_phase"] = MR->DataFlowInfo.hasDormantPhase;
+      dataFlowObj["avg_uses_per_phase"] = MR->DataFlowInfo.avgUsesPerPhase;
+      obj["data_flow"] = std::move(dataFlowObj);
+      
+      // 竞争分析
+      json::Object contentionObj;
+      contentionObj["contention_score"] = MR->ContentionInfo.contentionScore;
+      switch (MR->ContentionInfo.type) {
+        case ContentionInfo::ContentionType::NONE:
+          contentionObj["contention_type"] = "none";
+          break;
+        case ContentionInfo::ContentionType::FALSE_SHARING:
+          contentionObj["contention_type"] = "false_sharing";
+          break;
+        case ContentionInfo::ContentionType::ATOMIC_CONTENTION:
+          contentionObj["contention_type"] = "atomic_contention";
+          break;
+        case ContentionInfo::ContentionType::LOCK_CONTENTION:
+          contentionObj["contention_type"] = "lock_contention";
+          break;
+        case ContentionInfo::ContentionType::BANDWIDTH_CONTENTION:
+          contentionObj["contention_type"] = "bandwidth_contention";
+          break;
+      }
+      contentionObj["contention_probability"] = MR->ContentionInfo.contentionProbability;
+      contentionObj["contention_points"] = MR->ContentionInfo.potentialContentionPoints;
+      obj["contention"] = std::move(contentionObj);
 
       root.push_back(std::move(obj));
     }
@@ -182,21 +277,45 @@ void MyModuleTransformPass::generateReport(const Module &M, llvm::ArrayRef<Mallo
       if (!MR->MallocCall)
         continue;
       json::Object obj;
-      obj["location"] = getSourceLocation(MR->MallocCall);
-      obj["size"] = (double)MR->AllocSize;
+      // 位置信息
+      obj["location"] = MR->SourceLocation;
+      obj["size"] = MR->AllocSize;
+
+      // 总得分
       obj["score"] = MR->Score;
-      obj["forced_hot"] = MR->UserForcedHot;
-      obj["unmatched_free"] = MR->UnmatchedFree;
-      obj["dyn_access"] = (double)MR->DynamicAccessCount;
-      obj["est_bw"] = MR->EstimatedBandwidth;
+
+      // 得分因子（加分项）
+      obj["stream_score"] = MR->StreamScore;
+      obj["vector_score"] = MR->VectorScore;
+      obj["parallel_score"] = MR->ParallelScore;
+
+      // 扣分因子
+      obj["ssa_penalty"] = MR->SSAPenalty;
+      obj["chaos_penalty"] = MR->ChaosPenalty;
+      obj["conflict_penalty"] = MR->ConflictPenalty;
+
+      // 静态分析状态
       obj["stream"] = MR->IsStreamAccess;
       obj["vectorized"] = MR->IsVectorized;
       obj["parallel"] = MR->IsParallel;
       obj["thread_partitioned"] = MR->IsThreadPartitioned;
       obj["may_conflict"] = MR->MayConflict;
-      obj["chaos_score"] = MR->ChaosScore;
+
+      // Loop特征
+      obj["loop_depth"] = MR->LoopDepth;
+      obj["trip_count"] = MR->TripCount;
+
+      // 动态 profile 信息
+      obj["dyn_access"] = MR->DynamicAccessCount;
+      obj["est_bw"] = MR->EstimatedBandwidth;
+
+      // 分析矛盾标志
       obj["dynamic_hot_static_low"] = MR->WasDynamicHotButStaticLow;
       obj["static_hot_dynamic_cold"] = MR->WasStaticHotButDynamicCold;
+
+      // 其它状态标记
+      obj["forced_hot"] = MR->UserForcedHot;
+      obj["unmatched_free"] = MR->UnmatchedFree;
       root.push_back(std::move(obj));
     }
     std::string js;
