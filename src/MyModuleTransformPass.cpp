@@ -18,37 +18,40 @@ using namespace MyAdvancedHBM;
 cl::opt<std::string> MyModuleTransformPass::HBMReportFile(
     "hbm-report-file",
     cl::desc("Path to write HBM analysis report file"),
-    cl::init("")
-);
+    cl::init(""));
 
 cl::opt<std::string> MyModuleTransformPass::ExternalProfileFile(
     "hbm-profile-file",
     cl::desc("Optional external profile JSON file for advanced mem analysis"),
-    cl::init("")
-);
+    cl::init(""));
 
-PreservedAnalyses MyModuleTransformPass::run(Module &M, llvm::ModuleAnalysisManager &MAM) {
-  llvm::SmallVector<MallocRecord*, 16> AllMallocs;
+PreservedAnalyses MyModuleTransformPass::run(Module &M, llvm::ModuleAnalysisManager &MAM)
+{
+  llvm::SmallVector<MallocRecord *, 16> AllMallocs;
   auto &FAMProxy = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M);
   auto &FAM = FAMProxy.getManager();
-  for (Function &F : M) {
+  for (Function &F : M)
+  {
     if (F.isDeclaration())
       continue;
     auto &FMI = FAM.getResult<MyFunctionAnalysisPass>(F);
     for (auto &MR : FMI.MallocRecords)
       AllMallocs.push_back(&MR);
   }
-  if (!ExternalProfileFile.empty()) loadExternalProfile(M, AllMallocs);
+  if (!ExternalProfileFile.empty())
+    loadExternalProfile(M, AllMallocs);
   processMallocRecords(M, AllMallocs);
   generateReport(M, AllMallocs, true);
   return PreservedAnalyses::none();
 }
 
-void MyModuleTransformPass::loadExternalProfile(Module &M, llvm::SmallVectorImpl<MallocRecord*> &AllMallocs) {
+void MyModuleTransformPass::loadExternalProfile(Module &M, llvm::SmallVectorImpl<MallocRecord *> &AllMallocs)
+{
   std::string profileFile = ExternalProfileFile.getValue();
   errs() << "[MyModuleTransformPass] Loading external profile: " << profileFile << "\n";
   std::ifstream ifs(profileFile);
-  if (!ifs.is_open()) {
+  if (!ifs.is_open())
+  {
     errs() << "  Cannot open profile file!\n";
     return;
   }
@@ -57,41 +60,50 @@ void MyModuleTransformPass::loadExternalProfile(Module &M, llvm::SmallVectorImpl
   ifs.close();
   std::string contents = buffer.str();
   auto jsonOrErr = json::parse(contents);
-  if (!jsonOrErr) {
+  if (!jsonOrErr)
+  {
     errs() << "  JSON parse error!\n";
     return;
   }
   auto *arr = jsonOrErr->getAsArray();
-  if (!arr) {
+  if (!arr)
+  {
     errs() << "  Not a JSON array!\n";
     return;
   }
   // 假设 JSON 结构为:
   // [ {"function": "foo", "line": 30, "dyn_access": 1000000, "bandwidth": 25.2, "is_stream": true}, ... ]
-  for (auto &entry : *arr) {
+  for (auto &entry : *arr)
+  {
     auto *obj = entry.getAsObject();
-    if (!obj) continue;
+    if (!obj)
+      continue;
     std::string funcName = obj->getString("function").value_or("").str();
     int lineNum = (int)obj->getNumber("line").value_or(0.0);
     double dynAccess = obj->getNumber("dyn_access").value_or(0.0);
     double bw = obj->getNumber("bandwidth").value_or(0.0);
     bool isStrm = obj->getBoolean("is_stream").value_or(false);
-    for (auto *MR : AllMallocs) {
+    for (auto *MR : AllMallocs)
+    {
       auto *CI = MR->MallocCall;
-      if (!CI) continue;
+      if (!CI)
+        continue;
       Function *F = CI->getFunction();
       if (F->getName() != funcName)
         continue;
       auto loc = getSourceLocation(CI);
       int foundLine = 0;
-      if (!loc.empty()) {
+      if (!loc.empty())
+      {
         size_t pos = loc.rfind(':');
-        if (pos != std::string::npos) {
+        if (pos != std::string::npos)
+        {
           std::string linePart = loc.substr(pos + 1);
           foundLine = atoi(linePart.c_str());
         }
       }
-      if (foundLine == lineNum) {
+      if (foundLine == lineNum)
+      {
         MR->DynamicAccessCount = (uint64_t)dynAccess;
         MR->EstimatedBandwidth = bw;
         MR->IsStreamAccess = MR->IsStreamAccess || isStrm;
@@ -104,30 +116,34 @@ void MyModuleTransformPass::loadExternalProfile(Module &M, llvm::SmallVectorImpl
   }
 }
 
-void MyModuleTransformPass::processMallocRecords(Module &M, llvm::SmallVectorImpl<MallocRecord*> &AllMallocs) {
-  
+void MyModuleTransformPass::processMallocRecords(Module &M, llvm::SmallVectorImpl<MallocRecord *> &AllMallocs)
+{
+
   // 先计算自适应阈值
   std::vector<MallocRecord> AllMallocsVec;
-  for (auto *MR : AllMallocs) {
-    if (MR) AllMallocsVec.push_back(*MR);
+  for (auto *MR : AllMallocs)
+  {
+    if (MR)
+      AllMallocsVec.push_back(*MR);
   }
-  
+
   MyFunctionAnalysisPass MFAP;
   AdaptiveThresholdInfo ThresholdInfo = MFAP.computeAdaptiveThreshold(M, AllMallocsVec);
-  
+
   // 输出自适应阈值信息
-  errs() << "[HBM] Using adaptive threshold: " << ThresholdInfo.adjustedThreshold 
-         << " (base: " << ThresholdInfo.baseThreshold 
+  errs() << "[HBM] Using adaptive threshold: " << ThresholdInfo.adjustedThreshold
+         << " (base: " << ThresholdInfo.baseThreshold
          << "): " << ThresholdInfo.adjustmentReason << "\n";
-  
+
   // 排序和处理 MallocRecords
   std::sort(AllMallocs.begin(), AllMallocs.end(),
-            [](const MallocRecord *A, const MallocRecord *B) {
+            [](const MallocRecord *A, const MallocRecord *B)
+            {
               if (A->UserForcedHot != B->UserForcedHot)
                 return (A->UserForcedHot > B->UserForcedHot);
               return (A->ProfileAdjustedScore > B->ProfileAdjustedScore);
             });
-  
+
   uint64_t used = 0ULL;
   uint64_t capacity = DefaultHBMCapacity;
   LLVMContext &Ctx = M.getContext();
@@ -140,23 +156,24 @@ void MyModuleTransformPass::processMallocRecords(Module &M, llvm::SmallVectorImp
   FunctionCallee HBMFree = M.getOrInsertFunction(
       "hbm_free",
       FunctionType::get(VoidTy, {Int8PtrTy}, false));
-  
-  for (auto *MR : AllMallocs) {
+
+  for (auto *MR : AllMallocs)
+  {
     if (!MR->MallocCall)
       continue;
     if (!MR->UserForcedHot && MR->ProfileAdjustedScore < ThresholdInfo.adjustedThreshold)
       continue;
     if (!MR->UserForcedHot && (used + MR->AllocSize > capacity))
       continue;
-    
+
     // 提供详细的决策信息输出
-    errs() << "[HBM] Moving to HBM: " << getSourceLocation(MR->MallocCall) 
-    << " | Score: " << MR->ProfileAdjustedScore 
-    << " | Bandwidth: " << MR->MultiDimScore.bandwidthScore
-    << " | Latency: " << MR->MultiDimScore.latencyScore
-    << " | Utilization: " << MR->MultiDimScore.utilizationScore
-    << " | Size efficiency: " << MR->MultiDimScore.sizeEfficiencyScore
-    << "\n";
+    errs() << "[HBM] Moving to HBM: " << getSourceLocation(MR->MallocCall)
+           << " | Score: " << MR->ProfileAdjustedScore
+           << " | Bandwidth: " << MR->MultiDimScore.bandwidthScore
+           << " | Latency: " << MR->MultiDimScore.latencyScore
+           << " | Utilization: " << MR->MultiDimScore.utilizationScore
+           << " | Size efficiency: " << MR->MultiDimScore.sizeEfficiencyScore
+           << "\n";
     MR->MallocCall->setCalledFunction(HBMAlloc.getCallee());
     used += MR->AllocSize;
     // 直接使用 FreeCalls，而不是通过指针访问
@@ -166,11 +183,14 @@ void MyModuleTransformPass::processMallocRecords(Module &M, llvm::SmallVectorImp
   errs() << "[MyModuleTransformPass] HBM used: " << used << "/" << capacity << "\n";
 }
 
-void MyModuleTransformPass::generateReport(const Module &M, llvm::ArrayRef<MallocRecord*> AllMallocs, bool JSONOutput) {
-  if (HBMReportFile.empty()) {
+void MyModuleTransformPass::generateReport(const Module &M, llvm::ArrayRef<MallocRecord *> AllMallocs, bool JSONOutput)
+{
+  if (HBMReportFile.empty())
+  {
     errs() << "=== HBM Analysis Report ===\n";
     json::Array root;
-    for (auto *MR : AllMallocs) {
+    for (auto *MR : AllMallocs)
+    {
       if (!MR->MallocCall)
         continue;
       json::Object obj;
@@ -223,7 +243,7 @@ void MyModuleTransformPass::generateReport(const Module &M, llvm::ArrayRef<Mallo
       crossFnObj["external_func_propagation"] = MR->CrossFnInfo.isPropagatedToExternalFunc;
       crossFnObj["hot_func_usage"] = MR->CrossFnInfo.isUsedInHotFunction;
       obj["cross_function"] = std::move(crossFnObj);
-      
+
       // 数据流分析
       json::Object dataFlowObj;
       dataFlowObj["data_flow_score"] = MR->DataFlowInfo.dataFlowScore;
@@ -232,26 +252,27 @@ void MyModuleTransformPass::generateReport(const Module &M, llvm::ArrayRef<Mallo
       dataFlowObj["has_dormant_phase"] = MR->DataFlowInfo.hasDormantPhase;
       dataFlowObj["avg_uses_per_phase"] = MR->DataFlowInfo.avgUsesPerPhase;
       obj["data_flow"] = std::move(dataFlowObj);
-      
+
       // 竞争分析
       json::Object contentionObj;
       contentionObj["contention_score"] = MR->ContentionInfo.contentionScore;
-      switch (MR->ContentionInfo.type) {
-        case ContentionInfo::ContentionType::NONE:
-          contentionObj["contention_type"] = "none";
-          break;
-        case ContentionInfo::ContentionType::FALSE_SHARING:
-          contentionObj["contention_type"] = "false_sharing";
-          break;
-        case ContentionInfo::ContentionType::ATOMIC_CONTENTION:
-          contentionObj["contention_type"] = "atomic_contention";
-          break;
-        case ContentionInfo::ContentionType::LOCK_CONTENTION:
-          contentionObj["contention_type"] = "lock_contention";
-          break;
-        case ContentionInfo::ContentionType::BANDWIDTH_CONTENTION:
-          contentionObj["contention_type"] = "bandwidth_contention";
-          break;
+      switch (MR->ContentionInfo.type)
+      {
+      case ContentionInfo::ContentionType::NONE:
+        contentionObj["contention_type"] = "none";
+        break;
+      case ContentionInfo::ContentionType::FALSE_SHARING:
+        contentionObj["contention_type"] = "false_sharing";
+        break;
+      case ContentionInfo::ContentionType::ATOMIC_CONTENTION:
+        contentionObj["contention_type"] = "atomic_contention";
+        break;
+      case ContentionInfo::ContentionType::LOCK_CONTENTION:
+        contentionObj["contention_type"] = "lock_contention";
+        break;
+      case ContentionInfo::ContentionType::BANDWIDTH_CONTENTION:
+        contentionObj["contention_type"] = "bandwidth_contention";
+        break;
       }
       contentionObj["contention_probability"] = MR->ContentionInfo.contentionProbability;
       contentionObj["contention_points"] = MR->ContentionInfo.potentialContentionPoints;
@@ -265,15 +286,19 @@ void MyModuleTransformPass::generateReport(const Module &M, llvm::ArrayRef<Mallo
     rso.flush();
     errs() << js << "\n";
     errs() << "===========================\n";
-  } else {
+  }
+  else
+  {
     std::error_code EC;
     raw_fd_ostream out(HBMReportFile.getValue(), EC, sys::fs::OF_Text);
-    if (EC) {
+    if (EC)
+    {
       errs() << "Cannot open report file: " << HBMReportFile.getValue() << "\n";
       return;
     }
     json::Array root;
-    for (auto *MR : AllMallocs) {
+    for (auto *MR : AllMallocs)
+    {
       if (!MR->MallocCall)
         continue;
       json::Object obj;
@@ -326,10 +351,12 @@ void MyModuleTransformPass::generateReport(const Module &M, llvm::ArrayRef<Mallo
   }
 }
 
-std::string MyModuleTransformPass::getSourceLocation(CallInst *CI) {
+std::string MyModuleTransformPass::getSourceLocation(CallInst *CI)
+{
   if (!CI)
     return "";
-  if (DILocation *Loc = CI->getDebugLoc()) {
+  if (DILocation *Loc = CI->getDebugLoc())
+  {
     unsigned Line = Loc->getLine();
     StringRef File = Loc->getFilename();
     if (File.empty())

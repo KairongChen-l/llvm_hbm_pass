@@ -8,7 +8,8 @@
 using namespace llvm;
 using namespace MyAdvancedHBM;
 
-llvm::PreservedAnalyses MyInstrumentationPass::run(Function &F, FunctionAnalysisManager &FAM) {
+llvm::PreservedAnalyses MyInstrumentationPass::run(Function &F, FunctionAnalysisManager &FAM)
+{
   if (F.isDeclaration())
     return PreservedAnalyses::all();
 
@@ -20,15 +21,18 @@ llvm::PreservedAnalyses MyInstrumentationPass::run(Function &F, FunctionAnalysis
   EntryBuilder.CreateCall(StartFn);
 
   std::vector<Instruction *> Insts;
-  for (auto &BB : F) {
-    for (auto &I : BB) {
+  for (auto &BB : F)
+  {
+    for (auto &I : BB)
+    {
       if (isa<LoadInst>(I) || isa<StoreInst>(I))
         Insts.push_back(&I);
     }
   }
 
   // 对每个 Load/Store 指令进行插桩
-  for (auto *I : Insts) {
+  for (auto *I : Insts)
+  {
     if (auto *LD = dyn_cast<LoadInst>(I))
       instrumentLoadOrStore(LD, false);
     else if (auto *ST = dyn_cast<StoreInst>(I))
@@ -36,8 +40,10 @@ llvm::PreservedAnalyses MyInstrumentationPass::run(Function &F, FunctionAnalysis
   }
 
   // 在所有返回点插入 record_end_time()（也可进一步优化为统一出口）
-  for (auto &BB : F) {
-    if (ReturnInst *RetInst = dyn_cast<ReturnInst>(BB.getTerminator())) {
+  for (auto &BB : F)
+  {
+    if (ReturnInst *RetInst = dyn_cast<ReturnInst>(BB.getTerminator()))
+    {
       IRBuilder<> RetBuilder(RetInst);
       FunctionCallee EndFn = F.getParent()->getOrInsertFunction(
           "record_end_time",
@@ -49,7 +55,8 @@ llvm::PreservedAnalyses MyInstrumentationPass::run(Function &F, FunctionAnalysis
   return PreservedAnalyses::none();
 }
 
-void MyInstrumentationPass::instrumentLoadOrStore(Instruction *I, bool isStore) {
+void MyInstrumentationPass::instrumentLoadOrStore(Instruction *I, bool isStore)
+{
   Module *M = I->getModule();
   LLVMContext &Ctx = M->getContext();
   IRBuilder<> Builder(I);
@@ -59,11 +66,12 @@ void MyInstrumentationPass::instrumentLoadOrStore(Instruction *I, bool isStore) 
     Addr = LD->getPointerOperand();
   else if (auto *ST = dyn_cast<StoreInst>(I))
     Addr = ST->getPointerOperand();
-  if (!Addr) return;
+  if (!Addr)
+    return;
 
-  Type *VoidTy    = Type::getVoidTy(Ctx);
+  Type *VoidTy = Type::getVoidTy(Ctx);
   Type *Int8PtrTy = Type::getInt8PtrTy(Ctx);
-  Type *BoolTy    = Type::getInt1Ty(Ctx);
+  Type *BoolTy = Type::getInt1Ty(Ctx);
 
   // 获取 record_mem_access 函数，其签名为 void record_mem_access(void*, bool)
   FunctionCallee Fn = M->getOrInsertFunction(
@@ -82,7 +90,8 @@ void MyInstrumentationPass::instrumentLoadOrStore(Instruction *I, bool isStore) 
   Builder.CreateCall(RecFn, {Builder.getInt64(size)});
 }
 
-uint64_t MyInstrumentationPass::getAccessSize(Instruction *I) const {
+uint64_t MyInstrumentationPass::getAccessSize(Instruction *I) const
+{
   const DataLayout &DL = I->getModule()->getDataLayout();
   Type *accessedTy = nullptr;
   if (auto *LD = dyn_cast<LoadInst>(I))
@@ -95,7 +104,8 @@ uint64_t MyInstrumentationPass::getAccessSize(Instruction *I) const {
   return DL.getTypeStoreSize(accessedTy);
 }
 
-Value* MyInstrumentationPass::getThreadID(IRBuilder<> &Builder, Module *M) {
+Value *MyInstrumentationPass::getThreadID(IRBuilder<> &Builder, Module *M)
+{
   // TODO: 根据需求完善获取线程ID的逻辑
   return nullptr;
 }

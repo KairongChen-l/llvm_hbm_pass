@@ -8,16 +8,19 @@
 #include "llvm/Passes/PassBuilder.h"
 #include <vector>
 
-namespace MyAdvancedHBM {
+namespace MyAdvancedHBM
+{
 
-class MyInstrumentationPass : public llvm::PassInfoMixin<MyInstrumentationPass> {
-public:
-  llvm::PreservedAnalyses run(llvm::Function &F, llvm::FunctionAnalysisManager &FAM);
-private:
-  void instrumentLoadOrStore(llvm::Instruction *I, bool isStore);
-  uint64_t getAccessSize(llvm::Instruction *I) const;
-  llvm::Value* getThreadID(llvm::IRBuilder<> &Builder, llvm::Module *M);
-};
+  class MyInstrumentationPass : public llvm::PassInfoMixin<MyInstrumentationPass>
+  {
+  public:
+    llvm::PreservedAnalyses run(llvm::Function &F, llvm::FunctionAnalysisManager &FAM);
+
+  private:
+    void instrumentLoadOrStore(llvm::Instruction *I, bool isStore);
+    uint64_t getAccessSize(llvm::Instruction *I) const;
+    llvm::Value *getThreadID(llvm::IRBuilder<> &Builder, llvm::Module *M);
+  };
 
 } // namespace MyAdvancedHBM
 
